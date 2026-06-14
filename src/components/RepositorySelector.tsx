@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Search, Github, AlertCircle, Loader, Terminal, Sparkles, BookOpen, Layers, LogIn, ShieldCheck } from "lucide-react";
+import { Search, Github, AlertCircle, Loader, Terminal, Sparkles, BookOpen, Layers, LogIn, ShieldCheck, Database, AlertTriangle } from "lucide-react";
 
 interface RepositorySelectorProps {
   onAnalyze: (url: string) => void;
@@ -9,6 +9,8 @@ interface RepositorySelectorProps {
   userScans: any[];
   onSelectScan: (scan: any) => void;
   onLogin: () => void;
+  isFirebaseConfigured?: boolean;
+  authError?: string | null;
 }
 
 export default function RepositorySelector({
@@ -19,6 +21,8 @@ export default function RepositorySelector({
   userScans,
   onSelectScan,
   onLogin,
+  isFirebaseConfigured = false,
+  authError,
 }: RepositorySelectorProps) {
   const [url, setUrl] = useState("");
 
@@ -134,24 +138,61 @@ export default function RepositorySelector({
 
       {/* Auth Banner & Recent Scan History */}
       {!user ? (
-        <div className="mb-8 p-6 bg-blue-50/40 border border-blue-100 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="p-3 bg-blue-50 text-blue-600 rounded-xl">
-              <ShieldCheck className="w-6 h-6" />
+        <div className="space-y-4 mb-8">
+          {/* Active Auth Error Alert */}
+          {authError && (
+            <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs flex items-start gap-2.5 font-sans">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-bold">Authentication Concern:</span> {authError}
+              </div>
             </div>
-            <div>
-              <h3 className="text-sm font-extrabold text-slate-800">Enable Persistent Analysis History</h3>
-              <p className="text-xs text-slate-500 mt-0.5 font-sans leading-relaxed">
-                Log in securely using Google to unlock active scan history preservation and retrieve past reports instantly.
-              </p>
+          )}
+
+          {!isFirebaseConfigured ? (
+            <div className="p-5 bg-slate-50 border border-slate-200 rounded-2xl flex flex-col md:flex-row items-start md:items-center justify-between gap-4 font-sans">
+              <div className="flex items-start gap-3">
+                <div className="p-3 bg-slate-200/60 rounded-xl shrink-0 flex items-center justify-center">
+                  <Database className="w-6 h-6 text-slate-550 text-slate-500" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-slate-700 flex items-center gap-2">
+                    Firestore History Service Offline
+                    <span className="text-3xs font-black bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full uppercase tracking-wide">Demo Sandbox Mode</span>
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5 font-sans leading-relaxed">
+                    Firebase environment configurations are unconfigured. Sign In with Google is deactivated until environment variables (<code className="bg-slate-200 px-1 py-0.5 rounded text-2xs">VITE_FIREBASE_*</code>) are fully declared in Settings. All analyses run in instant lightweight sandbox session.
+                  </p>
+                </div>
+              </div>
+              <button
+                disabled
+                className="flex items-center justify-center gap-2 bg-slate-200 text-slate-400 font-semibold text-xs px-4 py-3 rounded-xl cursor-not-allowed shrink-0"
+              >
+                <LogIn className="w-4 h-4" /> Sign In Disabled
+              </button>
             </div>
-          </div>
-          <button
-            onClick={onLogin}
-            className="flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-4 py-3 rounded-xl transition-all shadow-xs cursor-pointer active:scale-98"
-          >
-            <LogIn className="w-4 h-4" /> Sign In with Google
-          </button>
+          ) : (
+            <div className="p-6 bg-blue-50/40 border border-blue-100 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-4 font-sans">
+              <div className="flex items-center gap-3">
+                <div className="p-3 bg-blue-50 text-blue-600 rounded-xl">
+                  <ShieldCheck className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-slate-800">Enable Persistent Analysis History</h3>
+                  <p className="text-xs text-slate-500 mt-0.5 font-sans leading-relaxed">
+                    Log in securely using Google to unlock active scan history preservation and retrieve past reports instantly.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={onLogin}
+                className="flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-4 py-3 rounded-xl transition-all shadow-xs cursor-pointer active:scale-98 animate-fade-in"
+              >
+                <LogIn className="w-4 h-4" /> Sign In with Google
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         userScans.length > 0 && (

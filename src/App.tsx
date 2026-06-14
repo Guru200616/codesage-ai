@@ -12,15 +12,27 @@ import ExecutionFlowModule from "./components/ExecutionFlowModule";
 import { Sparkles, LayoutDashboard, MessageSquareText, ShieldAlert, BadgeInfo, Network, Layers, BookOpen, FlaskConical, Github, LogOut, User } from "lucide-react";
 
 // Firebase/Firestore Imports
-import { auth, db, googleProvider, signInWithPopup, signOut, handleFirestoreError, OperationType } from "./lib/firebase";
-import { onAuthStateChanged, User as FirebaseUser } from "firebase/auth";
+import { 
+  auth,
+  db, 
+  handleFirestoreError, 
+  OperationType, 
+  isFirebaseConfigured, 
+  signInWithPopupWrapper, 
+  signOutWrapper, 
+  onAuthStateChangedWrapper,
+  getFriendlyAuthErrorMessage
+} from "./lib/firebase";
+import { User as FirebaseUser } from "firebase/auth";
 import { doc, getDoc, getDocFromServer, setDoc, collection, getDocs, serverTimestamp, query, orderBy } from "firebase/firestore";
+import ErrorBoundary from "./components/ErrorBoundary";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>("overview");
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   // Auth & DB states
   const [user, setUser] = useState<FirebaseUser | null>(null);
@@ -29,6 +41,7 @@ export default function App() {
   useEffect(() => {
     // 1. Connection validation (as instructed in section 'Validate Connection to Firestore' in SKILL.md)
     const testConnection = async () => {
+      if (!isFirebaseConfigured || !db) return;
       try {
         await getDocFromServer(doc(db, "test", "connection"));
       } catch (error) {
@@ -40,9 +53,9 @@ export default function App() {
     testConnection();
 
     // 2. Listen to Auth change
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+    const unsubscribe = onAuthStateChangedWrapper(async (currentUser) => {
       setUser(currentUser);
-      if (currentUser) {
+      if (currentUser && isFirebaseConfigured && db) {
         // Sync user document to Firestore DB
         try {
           const userDocRef = doc(db, "users", currentUser.uid);
@@ -69,7 +82,9 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
+
   const fetchUserScans = async (uid: string) => {
+    if (!isFirebaseConfigured || !db) return;
     const scansPath = `users/${uid}/scans`;
     try {
       const q = query(collection(db, scansPath), orderBy("createdAt", "desc"));
@@ -103,16 +118,19 @@ export default function App() {
   };
 
   const handleLogin = async () => {
+    setAuthError(null);
     try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (err) {
+      await signInWithPopupWrapper();
+    } catch (err: any) {
       console.error("Login attempt failed:", err);
+      const friendlyMsg = getFriendlyAuthErrorMessage(err.code || err.message);
+      setAuthError(friendlyMsg);
     }
   };
 
   const handleLogout = async () => {
     try {
-      await signOut(auth);
+      await signOutWrapper();
       setAnalysisResult(null);
     } catch (err) {
       console.error("Signout attempt failed:", err);
@@ -140,7 +158,7 @@ export default function App() {
       setActiveTab("overview");
 
       // Save to Firestore if user is authenticated
-      if (auth.currentUser) {
+      if (isFirebaseConfigured && db && auth?.currentUser) {
         const currentUser = auth.currentUser;
         const scanId = data.repository.id.replace(/[^a-zA-Z0-9_\-]/g, "_");
         const scanPath = `users/${currentUser.uid}/scans/${scanId}`;
@@ -231,7 +249,13 @@ export default function App() {
           ) : (
             <button
               onClick={handleLogin}
-              className="text-xs text-slate-700 hover:text-slate-900 font-bold flex items-center gap-2 bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl transition-all hover:border-slate-350 cursor-pointer"
+              disabled={!isFirebaseConfigured}
+              className={`text-xs font-bold flex items-center gap-2 bg-slate-50 border px-4 py-2.5 rounded-xl transition-all cursor-pointer ${
+                isFirebaseConfigured 
+                  ? "text-slate-700 hover:text-slate-900 hover:border-slate-350" 
+                  : "text-slate-400 border-slate-100 cursor-not-allowed opacity-50"
+              }`}
+              title={isFirebaseConfigured ? "Sign in to persist your scans" : "Firebase is unconfigured"}
             >
               <Github className="w-4 h-4" /> Sign In with Google
             </button>
@@ -242,7 +266,7 @@ export default function App() {
       {/* Main Container viewport */}
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 py-8 md:px-8">
         {!analysisResult ? (
-          <div className="animate-fade-in">
+          <div className="animate-fade-in font-sans">
             <RepositorySelector
               onAnalyze={handleAnalyze}
               isLoading={isLoading}
@@ -251,6 +275,8 @@ export default function App() {
               userScans={userScans}
               onSelectScan={handleSelectScan}
               onLogin={handleLogin}
+              isFirebaseConfigured={isFirebaseConfigured}
+              authError={authError}
             />
           </div>
         ) : (
@@ -287,21 +313,23 @@ export default function App() {
             </div>
 
             {/* View Port Router rendering */}
-            <div className="transition-all duration-300">
-              {activeTab === "overview" && (
-                <OverviewModule data={analysisResult} onSelectFile={handleSelectFile} onReset={handleReset} />
-              )}
-              {activeTab === "chat" && <ChatModule context={analysisResult} />}
-              {activeTab === "security" && <SecurityModule vulnerabilities={analysisResult.vulnerabilities} />}
-              {activeTab === "quality" && <QualityModule codeSmells={analysisResult.codeSmells} />}
-              {activeTab === "dependencies" && <DependencyGraphModule graph={analysisResult.dependencyGraph} />}
-              {activeTab === "flow" && <ExecutionFlowModule steps={analysisResult.flowTrace} />}
-              {activeTab === "docs" && (
-                <DocumentationModule docs={analysisResult.documentation} repositoryName={analysisResult.repository.name} />
-              )}
-              {activeTab === "tests" && (
-                <TestAutomationModule initialSuites={analysisResult.testSuites} allFiles={analysisResult.files} />
-              )}
+            <div className="transition-all duration-300 border-0 rounded-0 shadow-none">
+              <ErrorBoundary>
+                {activeTab === "overview" && (
+                  <OverviewModule data={analysisResult} onSelectFile={handleSelectFile} onReset={handleReset} />
+                )}
+                {activeTab === "chat" && <ChatModule context={analysisResult} />}
+                {activeTab === "security" && <SecurityModule vulnerabilities={analysisResult.vulnerabilities} />}
+                {activeTab === "quality" && <QualityModule codeSmells={analysisResult.codeSmells} />}
+                {activeTab === "dependencies" && <DependencyGraphModule graph={analysisResult.dependencyGraph} />}
+                {activeTab === "flow" && <ExecutionFlowModule steps={analysisResult.flowTrace} />}
+                {activeTab === "docs" && (
+                  <DocumentationModule docs={analysisResult.documentation} repositoryName={analysisResult.repository.name} />
+                )}
+                {activeTab === "tests" && (
+                  <TestAutomationModule initialSuites={analysisResult.testSuites} allFiles={analysisResult.files} />
+                )}
+              </ErrorBoundary>
             </div>
           </div>
         )}

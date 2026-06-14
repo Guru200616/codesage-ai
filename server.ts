@@ -1,7 +1,7 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { PRELOADED_REPOS } from "./src/preloadedRepos";
 import { AnalysisResult, ChatMessage } from "./src/types";
@@ -13,11 +13,32 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Initialize server-side Gemini client with recommended header settings
+// Helper: safe log to redact secrets if they leak anywhere
+const redactLog = (message: string) => {
+  const secretKey = process.env.GEMINI_API_KEY;
+  if (secretKey && message.includes(secretKey)) {
+    return message.replace(secretKey, "[REDACTED_GEMINI_KEY]");
+  }
+  const githubToken = process.env.GITHUB_TOKEN;
+  if (githubToken && message.includes(githubToken)) {
+    return message.replace(githubToken, "[REDACTED_GITHUB_TOKEN]");
+  }
+  return message;
+};
+
+const safeConsoleError = (message: string, ...args: any[]) => {
+  console.error(redactLog(message), ...args.map(a => typeof a === 'string' ? redactLog(a) : a));
+};
+
+const safeConsoleWarn = (message: string, ...args: any[]) => {
+  console.warn(redactLog(message), ...args.map(a => typeof a === 'string' ? redactLog(a) : a));
+};
+
+// Initialize server-side Gemini client with recommended settings
 const getGeminiClient = () => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    console.warn("WARNING: GEMINI_API_KEY is not defined in environment variables. CodeSage AI will run in local-emulation and fallback modes.");
+    console.warn("WARNING: GEMINI_API_KEY is not defined in environment variables. CodeSage AI will run in local demo-mode fallback.");
     return null;
   }
   return new GoogleGenAI({
@@ -32,24 +53,98 @@ const getGeminiClient = () => {
 
 const ai = getGeminiClient();
 
-// REST API endpoint: Health check
+// Retry helpers for GitHub & Gemini APIs (Requirement 14)
+async function fetchWithRetry(url: string, options: any, retries = 2, delay = 1000): Promise<Response> {
+  let lastError: any = null;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const response = await fetch(url, options);
+      // Only retry on transient server errors (500+). Do not retry 400 (Bad request), 403 (Forbidden/RateLimit) or 404 (Not found).
+      if (response.ok || response.status < 500) {
+        return response;
+      }
+      safeConsoleWarn(`[PROD LOG] Transient GitHub API status ${response.status} for ${url}. Retrying (${i + 1}/${retries})...`);
+    } catch (err: any) {
+      lastError = err;
+      if (i === retries) break;
+      safeConsoleWarn(`[PROD LOG] Transient fetch error on ${url}: ${err.message}. Retrying (${i + 1}/${retries})...`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay * (i + 1))); // exponential delay nudge
+  }
+  if (lastError) throw lastError;
+  // Return standard response if we exited loop with a high status response
+  return fetch(url, options);
+}
+
+async function generateContentWithRetry(aiClient: any, model: string, contents: any, config: any, retries = 2, delay = 1500): Promise<any> {
+  const apiKey = process.env.GEMINI_API_KEY || "";
+  let lastError: any = null;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await aiClient.models.generateContent({
+        model,
+        contents,
+        config
+      });
+    } catch (err: any) {
+      lastError = err;
+      const errMsg = err?.message || String(err);
+      
+      // Immediate exit for unrecoverable API Key problems
+      const isInvalidKey = errMsg.includes("API_KEY_INVALID") || 
+                           errMsg.toLowerCase().includes("api key") || 
+                           errMsg.toLowerCase().includes("expired");
+      if (isInvalidKey) {
+        safeConsoleError("[PROD LOG] Gemini API critical key error: Gemini API key is invalid or expired.");
+        throw err;
+      }
+
+      const isRateLimit = errMsg.includes("429") || errMsg.toLowerCase().includes("quota") || errMsg.toLowerCase().includes("rate limit");
+      if (i === retries) {
+        break;
+      }
+
+      safeConsoleWarn(`[PROD LOG] Gemini model call failed: ${errMsg}. Retrying (${i + 1}/${retries})...`);
+      // Wait longer for rate limits
+      await new Promise((resolve) => setTimeout(resolve, delay * (isRateLimit ? 5 : 1) * (i + 1)));
+    }
+  }
+  throw lastError;
+}
+
+// REST API endpoint: Health check (Requirement 10)
 app.get("/api/health", (req, res) => {
-  res.json({ status: "healthy", time: new Date().toISOString() });
+  const hasFirebaseConfig = !!(
+    process.env.VITE_FIREBASE_API_KEY &&
+    process.env.VITE_FIREBASE_PROJECT_ID &&
+    process.env.VITE_FIREBASE_APP_ID
+  );
+  const hasGeminiConfig = !!process.env.GEMINI_API_KEY;
+
+  res.json({
+    status: "healthy",
+    firebase: hasFirebaseConfig,
+    gemini: hasGeminiConfig
+  });
 });
 
 // REST API endpoint: Get Preloaded Repositories list
-app.get("/api/preloaded", (req, res) => {
-  const reposSummary = Object.values(PRELOADED_REPOS).map((r) => ({
-    id: r.repository.id,
-    name: r.repository.name,
-    owner: r.repository.owner,
-    description: r.repository.description,
-    framework: r.repository.framework,
-    mainLanguage: r.repository.mainLanguage,
-    healthScore: r.repository.healthScore,
-    findingsCount: r.repository.findingsCount,
-  }));
-  res.json(reposSummary);
+app.get("/api/preloaded", (req, res, next) => {
+  try {
+    const reposSummary = Object.values(PRELOADED_REPOS).map((r) => ({
+      id: r.repository.id,
+      name: r.repository.name,
+      owner: r.repository.owner,
+      description: r.repository.description,
+      framework: r.repository.framework,
+      mainLanguage: r.repository.mainLanguage,
+      healthScore: r.repository.healthScore,
+      findingsCount: r.repository.findingsCount,
+    }));
+    res.json(reposSummary);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Helper: Extract owner and repo from various GitHub URL structures
@@ -71,30 +166,36 @@ const parseGithubUrl = (inputUrl: string) => {
 };
 
 // REST API endpoint: Analyze repository (Live or Preloaded)
-app.post("/api/analyze", async (req, res) => {
-  const { url } = req.body;
-  if (!url) {
-    return res.status(400).json({ error: "GitHub Repository URL is required" });
-  }
-
-  // Check if it matches a preloaded repository ID
-  const lowerUrl = url.toLowerCase();
-  for (const key of Object.keys(PRELOADED_REPOS)) {
-    if (lowerUrl.includes(key)) {
-      return res.json(PRELOADED_REPOS[key]);
-    }
-  }
-
-  const matches = parseGithubUrl(url);
-  if (!matches) {
-    return res.status(400).json({
-      error: "Invalid GitHub URL format. Please provide a standard public URL e.g., https://github.com/expressjs/express",
-    });
-  }
-
-  const { owner, repo } = matches;
-
+app.post("/api/analyze", async (req, res, next) => {
   try {
+    const { url } = req.body;
+    if (!url) {
+      return res.status(400).json({
+        success: false,
+        message: "GitHub Repository URL is required",
+        details: "Field 'url' was missing in payload."
+      });
+    }
+
+    // Check if it matches a preloaded repository ID
+    const lowerUrl = url.toLowerCase();
+    for (const key of Object.keys(PRELOADED_REPOS)) {
+      if (lowerUrl.includes(key)) {
+        return res.json(PRELOADED_REPOS[key]);
+      }
+    }
+
+    const matches = parseGithubUrl(url);
+    if (!matches) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid GitHub URL format. Please provide a standard public URL (e.g., https://github.com/expressjs/express)",
+        details: "Supplied value could not be resolved to owner/repository signature."
+      });
+    }
+
+    const { owner, repo } = matches;
+
     const gitHeaders: Record<string, string> = {
       "User-Agent": "CodeSage-AI-Agent-Applet",
     };
@@ -102,14 +203,44 @@ app.post("/api/analyze", async (req, res) => {
       gitHeaders["Authorization"] = `token ${process.env.GITHUB_TOKEN}`;
     }
 
-    // 1. Fetch Repository Meta via public GitHub API
-    const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
-      headers: gitHeaders,
-    });
+    // 1. Fetch Repository Meta via public GitHub API with Retry
+    let repoRes: Response;
+    try {
+      repoRes = await fetchWithRetry(`https://api.github.com/repos/${owner}/${repo}`, {
+        headers: gitHeaders,
+      });
+    } catch (fetchErr: any) {
+      safeConsoleError(`[PROD LOG] Network transport error communicating with Github API: ${fetchErr.message}`);
+      // Fallback matching
+      const matchedKey = Object.keys(PRELOADED_REPOS).find(
+        (key) => repo.toLowerCase().includes(key) || key.includes(repo.toLowerCase())
+      ) || "express-auth-stripe";
+      return res.json(PRELOADED_REPOS[matchedKey]);
+    }
 
     if (!repoRes.ok) {
-      // Fallback if rate limited or invalid
-      console.warn(`GitHub API failed. Status: ${repoRes.status}. Falling back to preloaded models matching keywords as a courtesy...`);
+      safeConsoleWarn(`[PROD LOG] GitHub API request failed | Repo: ${owner}/${repo} | Status: ${repoRes.status}`);
+      
+      // Specifically handle Rate Limit Exceeded
+      if (repoRes.status === 403) {
+        return res.status(403).json({
+          success: false,
+          message: "GitHub API Rate limit exceeded. Please configure GITHUB_TOKEN environment variable or inspect Preloaded Playground repositories.",
+          details: `GitHub API status: 403 Forbidden. Max hourly requests reached for public sandbox container.`
+        });
+      }
+
+      // Specifically handle Repo Not Found or Private
+      if (repoRes.status === 404) {
+        return res.status(404).json({
+          success: false,
+          message: "GitHub repository not found or is private.",
+          details: `GitHub API status: 404 Not Found. Ensure the URL points to a public, existing repository.`
+        });
+      }
+
+      // Fallback to preloaded keywords model
+      safeConsoleWarn(`GitHub API status ${repoRes.status}. Falling back to preloaded template...`);
       const matchedKey = Object.keys(PRELOADED_REPOS).find(
         (key) => repo.toLowerCase().includes(key) || key.includes(repo.toLowerCase())
       ) || "express-auth-stripe";
@@ -119,16 +250,21 @@ app.post("/api/analyze", async (req, res) => {
     const repoData = await repoRes.json();
 
     // 2. Fetch File tree structure from GitHub tree API
-    const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${repoData.default_branch || "main"}?recursive=1`, {
-      headers: gitHeaders,
-    });
+    let treeRes: Response;
+    try {
+      treeRes = await fetchWithRetry(`https://api.github.com/repos/${owner}/${repo}/git/trees/${repoData.default_branch || "main"}?recursive=1`, {
+        headers: gitHeaders,
+      });
+    } catch {
+      treeRes = { ok: false } as Response;
+    }
 
     let treeFiles: any[] = [];
     if (treeRes.ok) {
       const treeData = await treeRes.json();
       treeFiles = (treeData.tree || [])
         .filter((item: any) => item.type === "blob")
-        .slice(0, 80); // Limit files count to avoid overwhelming prompt
+        .slice(0, 80); // Limit files to fit inside the standard Gemini prompt context
     }
 
     // Prepare list of file paths
@@ -139,12 +275,12 @@ app.post("/api/analyze", async (req, res) => {
 
     if (!ai) {
       // Fallback when API key is missing
-      console.warn("Gemini API Client uninitialized. Generating smart mock analysis...");
+      safeConsoleWarn("[PROD LOG] Gemini API Client uninitialized. Creating smart mock analysis.");
       const result = generateGenericAnalysis(owner, repo, repoData, filePaths);
       return res.json(result);
     }
 
-    // 3. Harness server-side Gemini 3.5 Flash to generate true code intelligence
+    // 3. System Instruction for code architecture generation
     const systemPrompt = `You are CodeSage AI, a Principal Autonomous Code Intelligence Agent and Senior Software Architect.
 Your task is to analyze the following GitHub repository metadata and list of file paths to generate a production-grade, highly precise code security & architecture review.
 Generate an comprehensive analysis in JSON format aligning EXACTLY with the schema:
@@ -176,7 +312,6 @@ Generate an comprehensive analysis in JSON format aligning EXACTLY with the sche
     // Create 1-2 realistic code design smells relating to SOLID principles or architectural bottlenecks
   ],
   "dependencyGraph": {
-    // Generate nodes and edges matching the files list
     "nodes": [ {"id": "1", "label": "main.js", "type": "route", "file": "main.js"} ],
     "edges": [ {"id": "e1", "source": "1", "target": "2", "label": "imports"} ]
   },
@@ -191,79 +326,98 @@ Generate an comprehensive analysis in JSON format aligning EXACTLY with the sche
   ]
 }
 
-Ensure the output is clean JSON, with no markdown code block backticks (\`\`\`json) of any kind. Deliver raw parsable JSON.`;
+Ensure the output is clean JSON. Deliver raw parsable JSON matching this schema exactly.`;
 
     const userPrompt = `Analyze repository:
 Name: ${repo}
 Owner: ${owner}
-Description: ${repoData.description}
+Description: ${repoData.description || ""}
 Stargazers: ${repoData.stargazers_count}
-Main Language: ${repoData.language}
+Main Language: ${repoData.language || "TypeScript"}
 File structure tree includes:
 ${JSON.stringify(filePaths, null, 2)}
 `;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: [
-        { role: "user", parts: [{ text: userPrompt }] }
-      ],
-      config: {
-        systemInstruction: systemPrompt,
-        temperature: 0.2,
-        responseMimeType: "application/json"
+    // 4. Generate with Retry and error parsing (Requirement 5)
+    let textOutput = "";
+    try {
+      const response = await generateContentWithRetry(
+        ai,
+        "gemini-3.5-flash",
+        [{ role: "user", parts: [{ text: userPrompt }] }],
+        {
+          systemInstruction: systemPrompt,
+          temperature: 0.2,
+          responseMimeType: "application/json"
+        }
+      );
+      textOutput = response.text || "";
+    } catch (geminiErr: any) {
+      const errMsg = geminiErr?.message || String(geminiErr);
+      const isInvalidKey = errMsg.includes("API_KEY_INVALID") || 
+                           errMsg.toLowerCase().includes("api key") || 
+                           errMsg.toLowerCase().includes("expired");
+      
+      if (isInvalidKey) {
+        return res.status(401).json({
+          success: false,
+          error: "Gemini API key is invalid or expired."
+        });
       }
-    });
+      safeConsoleError(`[PROD LOG] Gemini analysis call failed completely: ${errMsg}. Falling back to default mock summary.`);
+      const fallbackResult = generateGenericAnalysis(owner, repo, repoData, filePaths);
+      return res.json(fallbackResult);
+    }
 
-    const textOutput = response.text || "";
     try {
       const cleanJsonStr = textOutput.trim();
       const report = JSON.parse(cleanJsonStr);
       return res.json(report);
     } catch (parseError) {
-      console.error("Gemini output parsing failed, response raw text:", textOutput);
-      // fallback
+      safeConsoleError("[PROD LOG] Prompt returned invalid JSON parser payload. Using auto-constructed fallback.", parseError);
       const result = generateGenericAnalysis(owner, repo, repoData, filePaths);
       return res.json(result);
     }
 
   } catch (error: any) {
-    console.error("Analysis route error:", error);
-    res.status(500).json({ error: error.message || "Internal Analysis Error" });
+    next(error);
   }
 });
 
 // REST API endpoint: AI-powered Chat (Contextual RAG)
-app.post("/api/chat", async (req, res) => {
-  const { message, history, context } = req.body; // context is the AnalysisResult object
-  if (!message) {
-    return res.status(400).json({ error: "Message is required" });
-  }
-
-  // Formulate a helpful context block of files, vulnerabilities, and structure for RAG
-  const repositoryName = context?.repository?.name || "the repository";
-  const repoFilesList = context?.files?.map((f: any) => `File: ${f.path}\nContent Highlight:\n${f.content || 'No content cached.'}`).join("\n\n") || "";
-  const repoVulnsList = context?.vulnerabilities?.map((v: any) => `- [${v.severity.toUpperCase()}] ${v.title} in ${v.file}:${v.line}\nDescription: ${v.description}`).join("\n") || "";
-  const repoSmellsList = context?.codeSmells?.map((s: any) => `- [${s.severity.toUpperCase()}] ${s.title} in ${s.file}\nReason: ${s.description}`).join("\n") || "";
-
-  if (!ai) {
-    // Simulated chatbot fallback when API key is missing
-    const simulatedAnswers = [
-      `I have examined **${repositoryName}**. Regarding your question, you can see how authentication is handled in \`src/middleware/auth.ts\`. A JWT validation occurs on authorization headers. Let me know if you would like to run diagnostic tests on it!`,
-      `In **${repositoryName}**, there is a verified vulnerability of category **SQL Injection** inside your controller files. This occurs because user inputs are directly interpolated inside the search parameters. I recommend migrating to prepared parameter queries.`,
-      `Looking at the architecture of **${repositoryName}**, the flow starts with front-facing Express controllers routing standard endpoints straight into database pools, where we query records dynamically. There is a potential tight coupling hotspot in db query connections.`,
-      `To configure and execute this project locally, ensure you copy the \`.env.example\` file and configure the appropriate variables. Then, execute \`npm install\` followed by developer hot reload tasks.`
-    ];
-    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-    await delay(1000);
-    const mockAnsText = simulatedAnswers[Math.floor(Math.random() * simulatedAnswers.length)];
-    return res.json({
-      text: mockAnsText,
-      references: context?.files?.slice(0, 1).map((f: any) => ({ file: f.path, codeSnippet: f.content?.slice(0, 200) })),
-    });
-  }
-
+app.post("/api/chat", async (req, res, next) => {
   try {
+    const { message, history, context } = req.body;
+    if (!message) {
+      return res.status(400).json({
+        success: false,
+        message: "Message is required",
+        details: "Field 'message' was missing in payload."
+      });
+    }
+
+    const repositoryName = context?.repository?.name || "the repository";
+    const repoFilesList = context?.files?.map((f: any) => `File: ${f.path}\nContent Highlight:\n${f.content || 'No content cached.'}`).join("\n\n") || "";
+    const repoVulnsList = context?.vulnerabilities?.map((v: any) => `- [${v.severity.toUpperCase()}] ${v.title} in ${v.file}:${v.line}\nDescription: ${v.description}`).join("\n") || "";
+    const repoSmellsList = context?.codeSmells?.map((s: any) => `- [${s.severity.toUpperCase()}] ${s.title} in ${s.file}\nReason: ${s.description}`).join("\n") || "";
+
+    if (!ai) {
+      safeConsoleWarn("[PROD LOG] Chat called without Gemini configurations. Rendering simulated mock feedback.");
+      const simulatedAnswers = [
+        `I have examined **${repositoryName}**. Regarding your question, you can see how authentication is handled in \`src/middleware/auth.ts\`. A JWT validation occurs on authorization headers. Let me know if you would like to run diagnostic tests on it!`,
+        `In **${repositoryName}**, there is a verified vulnerability of category **SQL Injection** inside your controller files. This occurs because user inputs are directly interpolated inside the search parameters. I recommend migrating to prepared parameter queries.`,
+        `Looking at the architecture of **${repositoryName}**, the flow starts with front-facing Express controllers routing standard endpoints straight into database pools, where we query records dynamically. There is a potential tight coupling hotspot in db query connections.`,
+        `To configure and execute this project locally, ensure you copy the \`.env.example\` file and configure the appropriate variables. Then, execute \`npm install\` followed by developer hot reload tasks.`
+      ];
+      const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      await delay(1000);
+      const mockAnsText = simulatedAnswers[Math.floor(Math.random() * simulatedAnswers.length)];
+      return res.json({
+        text: mockAnsText,
+        references: context?.files?.slice(0, 1).map((f: any) => ({ file: f.path, codeSnippet: f.content?.slice(0, 200) })),
+      });
+    }
+
     const chatHistory = (history || []).map((msg: ChatMessage) => ({
       role: msg.sender === "user" ? "user" : "model",
       parts: [{ text: msg.text }],
@@ -291,22 +445,36 @@ Answering Guidelines:
 1. Speak transparently, objectively, and with professional technical composure.
 2. Provide authentic answers citing real file names and lines from the parsed context above.
 3. Write actual code examples showing how to patch vulnerabilities, optimize call loops, or test files when asked.
-4. Keep answers clean, scannable, and formatted elegantly in Markdown.
-`;
+4. Keep answers clean, scannable, and formatted elegantly in Markdown.`;
 
-    const chatInstance = ai.chats.create({
-      model: "gemini-3.5-flash",
-      history: chatHistory,
-      config: {
-        systemInstruction,
-        temperature: 0.3,
-      },
-    });
+    let replyText = "";
+    try {
+      const chatInstance = ai.chats.create({
+        model: "gemini-3.5-flash",
+        history: chatHistory,
+        config: {
+          systemInstruction,
+          temperature: 0.3,
+        },
+      });
 
-    const response = await chatInstance.sendMessage({ message });
-    const replyText = response.text || "";
+      const response = await chatInstance.sendMessage({ message });
+      replyText = response.text || "";
+    } catch (geminiErr: any) {
+      const errMsg = geminiErr?.message || String(geminiErr);
+      const isInvalidKey = errMsg.includes("API_KEY_INVALID") || 
+                           errMsg.toLowerCase().includes("api key") || 
+                           errMsg.toLowerCase().includes("expired");
+      if (isInvalidKey) {
+        return res.status(401).json({
+          success: false,
+          error: "Gemini API key is invalid or expired."
+        });
+      }
+      throw geminiErr;
+    }
 
-    // Parse out potential files cited to add interactive references
+    // Parse potential files cited to add interactive references
     const references: any[] = [];
     if (context?.files) {
       for (const file of context.files) {
@@ -315,7 +483,7 @@ Answering Guidelines:
             file: file.path,
             codeSnippet: file.content ? file.content.slice(0, 300) + "\n..." : undefined,
           });
-          if (references.length >= 2) break; // Limit references count
+          if (references.length >= 2) break;
         }
       }
     }
@@ -326,29 +494,32 @@ Answering Guidelines:
     });
 
   } catch (error: any) {
-    console.error("Chat API error:", error);
-    res.status(500).json({ error: error.message || "Internal Chat Error" });
+    next(error);
   }
 });
 
 // REST API: Trigger specific code patch generation
-app.post("/api/vulnerability/fix", async (req, res) => {
-  const { vulnerability, fileContent } = req.body;
-  if (!vulnerability) {
-    return res.status(400).json({ error: "Vulnerability details are required" });
-  }
-
-  if (!ai) {
-    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-    await delay(1200);
-    return res.json({
-      explanation: `I have generated a high-fidelity secure fix for **${vulnerability.title}**. This modification safely sanitizes user input, replacing raw string concatenations with parameterized variables.`,
-      patchedCode: vulnerability.codeSnippet ? `// FIXED SECURITY FLW:\n` + vulnerability.codeSnippet.replace("vulnerable", "secure_parameterized") : `// Safe implementation applied.`
-    });
-  }
-
+app.post("/api/vulnerability/fix", async (req, res, next) => {
   try {
-    const systemPrompt = `You are CodeSage AI, a elite cybersecurity remediation expert.
+    const { vulnerability, fileContent } = req.body;
+    if (!vulnerability) {
+      return res.status(400).json({
+        success: false,
+        message: "Vulnerability details are required",
+        details: "Field 'vulnerability' was missing in payload."
+      });
+    }
+
+    if (!ai) {
+      const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      await delay(1200);
+      return res.json({
+        explanation: `I have generated a high-fidelity secure fix for **${vulnerability.title}**. This modification safely sanitizes user input, replacing raw string concatenations with parameterized variables.`,
+        patchedCode: vulnerability.codeSnippet ? `// FIXED SECURITY FLW:\n` + vulnerability.codeSnippet.replace("vulnerable", "secure_parameterized") : `// Safe implementation applied.`
+      });
+    }
+
+    const systemPrompt = `You are CodeSage AI, an elite cybersecurity remediation expert.
 Review this security vulnerability in the codebase, and write a precise, drop-in replacement secure snippet.
 Your response MUST be formatted in JSON containing exactly two properties:
 1. "explanation": A concise, structured explanation of the fix and security benefits.
@@ -367,103 +538,157 @@ Original Snippet / Frame:
 ${vulnerability.codeSnippet || fileContent || 'No visual reference.'}
 `;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-      config: {
-        systemInstruction: systemPrompt,
-        responseMimeType: "application/json",
-        temperature: 0.1,
+    let responseText = "";
+    try {
+      const response = await generateContentWithRetry(
+        ai,
+        "gemini-3.5-flash",
+        [{ role: "user", parts: [{ text: userPrompt }] }],
+        {
+          systemInstruction: systemPrompt,
+          responseMimeType: "application/json",
+          temperature: 0.1,
+        }
+      );
+      responseText = response.text || "{}";
+    } catch (geminiErr: any) {
+      const errMsg = geminiErr?.message || String(geminiErr);
+      const isInvalidKey = errMsg.includes("API_KEY_INVALID") || 
+                           errMsg.toLowerCase().includes("api key") || 
+                           errMsg.toLowerCase().includes("expired");
+      if (isInvalidKey) {
+        return res.status(401).json({
+          success: false,
+          error: "Gemini API key is invalid or expired."
+        });
       }
-    });
+      throw geminiErr;
+    }
 
-    const data = JSON.parse(response.text || "{}");
+    const data = JSON.parse(responseText);
     res.json(data);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || "Remediation failed" });
+    next(err);
   }
 });
 
 // REST API: Generate customized test suites for a given file
-app.post("/api/test/generate", async (req, res) => {
-  const { file, fileContent, framework } = req.body;
-  if (!file) {
-    return res.status(400).json({ error: "File details are required" });
-  }
+app.post("/api/test/generate", async (req, res, next) => {
+  try {
+    const { file, fileContent, framework } = req.body;
+    if (!file) {
+      return res.status(400).json({
+        success: false,
+        message: "File details are required",
+        details: "Field 'file' was missing."
+      });
+    }
 
-  const selectedFramework = framework || "jest";
+    const selectedFramework = framework || "jest";
 
-  if (!ai) {
-    return res.json({
-      testCode: `import request from 'supertest';
+    if (!ai) {
+      return res.json({
+        testCode: `import request from 'supertest';
 // Automated test template generated for ${file}
 describe('${file} spec', () => {
   it('correctly compiles modules and registers routes', async () => {
-    // Assert structural coverage is healthy
     expect(true).toBe(true);
   });
 });`
-    });
-  }
+      });
+    }
 
-  try {
     const systemPrompt = `You are a test automation engineer. Generate a modern, highly detailed testing suite for the file code in the requested testing framework (${selectedFramework}). Protect against edge cases and include mock structures. Return raw test output in JSON format with key:
 "testCode": "string (the complete code of the unit/integration/edge test suite)"`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: [{ role: "user", parts: [{ text: `File: ${file}\nCode content:\n${fileContent || 'export default {}'}` }] }],
-      config: {
-        systemInstruction: systemPrompt,
-        responseMimeType: "application/json",
-        temperature: 0.2,
+    let responseText = "";
+    try {
+      const response = await generateContentWithRetry(
+        ai,
+        "gemini-3.5-flash",
+        [{ role: "user", parts: [{ text: `File: ${file}\nCode content:\n${fileContent || 'export default {}'}` }] }],
+        {
+          systemInstruction: systemPrompt,
+          responseMimeType: "application/json",
+          temperature: 0.2,
+        }
+      );
+      responseText = response.text || "{}";
+    } catch (geminiErr: any) {
+      const errMsg = geminiErr?.message || String(geminiErr);
+      const isInvalidKey = errMsg.includes("API_KEY_INVALID") || 
+                           errMsg.toLowerCase().includes("api key") || 
+                           errMsg.toLowerCase().includes("expired");
+      if (isInvalidKey) {
+        return res.status(401).json({
+          success: false,
+          error: "Gemini API key is invalid or expired."
+        });
       }
-    });
+      throw geminiErr;
+    }
 
-    const data = JSON.parse(response.text || "{}");
+    const data = JSON.parse(responseText);
     res.json(data);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // REST API: Generate automated project documentation item
-app.post("/api/doc/generate", async (req, res) => {
-  const { category, repositoryName, filesList } = req.body;
-  
-  if (!ai) {
-    return res.json({
-      content: `# Generated Setup & Dev Guide for ${repositoryName}\n\n1. Run development environments.\n2. Standard environment settings configured.`
-    });
-  }
-
+app.post("/api/doc/generate", async (req, res, next) => {
   try {
+    const { category, repositoryName, filesList } = req.body;
+    
+    if (!ai) {
+      return res.json({
+        content: `# Generated Setup & Dev Guide for ${repositoryName}\n\n1. Run development environments.\n2. Standard environment settings configured.`
+      });
+    }
+
     const systemPrompt = `You are a technical writer. Write a comprehensive documentation chapter in elegant Markdown format. Categories support: 'readme', 'api', 'setup', 'architecture', 'developer'. 
 Return a JSON containing:
 "content": "string (Markdown source)"`;
 
     const userPrompt = `Develop document type: ${category} for ${repositoryName}. Highlight these files: ${JSON.stringify(filesList)}. Build precise, beautiful setup tutorials.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-      config: {
-        systemInstruction: systemPrompt,
-        responseMimeType: "application/json",
-        temperature: 0.3,
+    let responseText = "";
+    try {
+      const response = await generateContentWithRetry(
+        ai,
+        "gemini-3.5-flash",
+        [{ role: "user", parts: [{ text: userPrompt }] }],
+        {
+          systemInstruction: systemPrompt,
+          responseMimeType: "application/json",
+          temperature: 0.3,
+        }
+      );
+      responseText = response.text || "{}";
+    } catch (geminiErr: any) {
+      const errMsg = geminiErr?.message || String(geminiErr);
+      const isInvalidKey = errMsg.includes("API_KEY_INVALID") || 
+                           errMsg.toLowerCase().includes("api key") || 
+                           errMsg.toLowerCase().includes("expired");
+      if (isInvalidKey) {
+        return res.status(401).json({
+          success: false,
+          error: "Gemini API key is invalid or expired."
+        });
       }
-    });
+      throw geminiErr;
+    }
 
-    const data = JSON.parse(response.text || "{}");
+    const data = JSON.parse(responseText);
     res.json(data);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
 // Helper: fallback mock report synthesizer for standard requests
 function generateGenericAnalysis(owner: string, repo: string, repoData: any, filePaths: { path: string; size: number }[]): AnalysisResult {
-  const mainLang = repoData.language || "TypeScript";
+  const mainLang = (repoData && repoData.language) || "TypeScript";
   const frameworkName = mainLang === "TypeScript" || mainLang === "JavaScript" ? "Vite / Next.js" : "Standard Library Framework";
 
   return {
@@ -472,9 +697,9 @@ function generateGenericAnalysis(owner: string, repo: string, repoData: any, fil
       name: repo,
       owner,
       url: `https://github.com/${owner}/${repo}`,
-      description: repoData.description || "Auto-Parsed public intelligence catalog.",
-      stars: repoData.stargazers_count || 12,
-      forks: repoData.forks_count || 4,
+      description: (repoData && repoData.description) || "Auto-Parsed public intelligence catalog.",
+      stars: (repoData && repoData.stargazers_count) || 12,
+      forks: (repoData && repoData.forks_count) || 4,
       languages: [
         { name: mainLang, percentage: 80 },
         { name: "Others", percentage: 20 },
@@ -556,6 +781,16 @@ function generateGenericAnalysis(owner: string, repo: string, repoData: any, fil
     flowTrace: []
   };
 }
+
+// Global Custom Error Middleware (Requirement 7)
+app.use((err: any, req: any, res: any, next: any) => {
+  safeConsoleError("[PROD LOG] Global Express Error Catchment: ", err);
+  res.status(err.status || 500).json({
+    success: false,
+    message: err.message || "A secure backend server-side task failed.",
+    details: err.stack ? err.stack.toString() : String(err)
+  });
+});
 
 // Vite and Express serving layer setup
 async function startServer() {
