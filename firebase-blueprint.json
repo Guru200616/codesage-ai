@@ -1,0 +1,42 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile document",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "name": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "email", "name", "createdAt"]
+    },
+    "RepositoryScan": {
+      "title": "RepositoryScan",
+      "description": "Historical audit and security scan result for a repository",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "repositoryUrl": { "type": "string" },
+        "repository": { "type": "object" },
+        "vulnerabilities": { "type": "array" },
+        "codeSmells": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "repositoryUrl", "repository", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Public and private metadata for authenticated developers"
+    },
+    "/users/{userId}/scans/{scanId}": {
+      "schema": "RepositoryScan",
+      "description": "Historical audits mapped under individual user subcollection keys"
+    }
+  }
+}

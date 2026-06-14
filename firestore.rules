@@ -1,0 +1,84 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 1. Global safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global helper primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && (
+        request.auth.token.email_verified == true || 
+        request.auth.token.firebase.sign_in_provider == 'google.com'
+      );
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // User entity validation helper
+    function isValidUser(user) {
+      return user.keys().hasAll(['id', 'email', 'name', 'createdAt'])
+        && user.keys().size() == 4
+        && user.id == request.auth.uid
+        && user.email is string
+        && user.email.size() <= 256
+        && user.name is string
+        && user.name.size() <= 128
+        && user.createdAt == request.time;
+    }
+
+    // RepositoryScan entity validation helper
+    function isValidRepositoryScan(scan, userId) {
+      return scan.keys().hasAll(['id', 'userId', 'repositoryUrl', 'repository', 'createdAt', 'updatedAt'])
+        && scan.id is string
+        && scan.id.size() <= 256
+        && scan.userId == userId
+        && scan.userId == request.auth.uid
+        && scan.repositoryUrl is string
+        && scan.repositoryUrl.size() <= 2048
+        && scan.repository is map
+        && scan.createdAt == request.time
+        && scan.updatedAt == request.time;
+    }
+
+    // Collection matches
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) 
+        && request.resource.data.id == resource.data.id
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.keys().hasAll(['id', 'email', 'name', 'createdAt'])
+        && request.resource.data.keys().size() == 4
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 256
+        && request.resource.data.name is string
+        && request.resource.data.name.size() <= 128;
+      allow delete: if false;
+
+      match /scans/{scanId} {
+        allow get, list: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidRepositoryScan(request.resource.data, userId);
+        allow update: if isOwner(userId) 
+          && request.resource.data.id == resource.data.id
+          && request.resource.data.userId == resource.data.userId
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.repositoryUrl == resource.data.repositoryUrl
+          && request.resource.data.updatedAt == request.time;
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "CodeSage AI",
+  "description": "Understand, Explain, Secure, Review, and Analyze Any GitHub Repository with AI",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
