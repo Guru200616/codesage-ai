@@ -95,9 +95,16 @@ app.post("/api/analyze", async (req, res) => {
   const { owner, repo } = matches;
 
   try {
+    const gitHeaders: Record<string, string> = {
+      "User-Agent": "CodeSage-AI-Agent-Applet",
+    };
+    if (process.env.GITHUB_TOKEN) {
+      gitHeaders["Authorization"] = `token ${process.env.GITHUB_TOKEN}`;
+    }
+
     // 1. Fetch Repository Meta via public GitHub API
     const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
-      headers: { "User-Agent": "CodeSage-AI-Agent-Applet" },
+      headers: gitHeaders,
     });
 
     if (!repoRes.ok) {
@@ -113,12 +120,12 @@ app.post("/api/analyze", async (req, res) => {
 
     // 2. Fetch File tree structure from GitHub tree API
     const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${repoData.default_branch || "main"}?recursive=1`, {
-      headers: { "User-Agent": "CodeSage-AI-Agent-Applet" },
+      headers: gitHeaders,
     });
 
     let treeFiles: any[] = [];
     if (treeRes.ok) {
-      const treeData = await treeRes.ok ? await treeRes.json() : { tree: [] };
+      const treeData = await treeRes.json();
       treeFiles = (treeData.tree || [])
         .filter((item: any) => item.type === "blob")
         .slice(0, 80); // Limit files count to avoid overwhelming prompt
